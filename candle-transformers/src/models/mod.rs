@@ -56,6 +56,8 @@ pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;
 pub mod llava;
+#[cfg(feature = "ltx2")]
+pub mod ltx2;
 pub mod mamba;
 pub mod mamba2;
 pub mod marian;

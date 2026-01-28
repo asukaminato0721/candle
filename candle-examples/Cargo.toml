@@ -51,6 +51,7 @@ clap = { workspace = true }
 imageproc = { workspace = true }
 memmap2 = { workspace = true }
 rand = { workspace = true }
+hound = "3.5"
 ab_glyph = { workspace = true }
 tracing = { workspace = true }
 tracing-chrome = { workspace = true }
@@ -95,6 +96,7 @@ snac = ["cpal", "symphonia", "rubato"]
 depth_anything_v2 = ["palette", "enterpolation"]
 tekken = ["tekken-rs"]
 buildtime-download = []
+ltx2 = ["candle-transformers/ltx2"]
 
 [[example]]
 name = "llama_multiprocess"

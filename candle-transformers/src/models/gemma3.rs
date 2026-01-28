@@ -474,6 +474,7 @@ impl Model {
         batch_size: usize,
         seq_len: usize,
         seqlen_offset: usize,
+        attention_mask: Option<&Tensor>,
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         if seq_len <= 1 {
             return Ok((None, None));
@@ -497,6 +498,39 @@ impl Model {
             &self.device,
         )?;
 
+        let (mask, sliding_mask) = if let Some(attention_mask) = attention_mask {
+            let attention_mask = attention_mask.to_dtype(self.dtype)?;
+            let (b, l) = attention_mask.dims2()?;
+            if b != batch_size || l != seq_len {
+                candle::bail!(
+                    "attention_mask shape mismatch: expected ({batch_size}, {seq_len}), got ({b}, {l})"
+                )
+            }
+            let attention_mask = if seqlen_offset > 0 {
+                let ones = Tensor::ones((batch_size, seqlen_offset), self.dtype, &self.device)?;
+                Tensor::cat(&[&ones, &attention_mask], D::Minus1)?
+            } else {
+                attention_mask
+            };
+            let neg = match self.dtype {
+                DType::F16 => -65504.0,
+                _ => -1e9,
+            };
+            let neg = Tensor::full(neg, (), &self.device)?.to_dtype(self.dtype)?;
+            let pad_mask = attention_mask.broadcast_sub(&Tensor::ones_like(&attention_mask)?)?;
+            let pad_mask = pad_mask.broadcast_mul(&neg)?.reshape((
+                batch_size,
+                1,
+                1,
+                seq_len + seqlen_offset,
+            ))?;
+            let mask = mask.broadcast_add(&pad_mask)?;
+            let sliding_mask = sliding_mask.broadcast_add(&pad_mask)?;
+            (mask, sliding_mask)
+        } else {
+            (mask, sliding_mask)
+        };
+
         Ok((Some(mask), Some(sliding_mask)))
     }
 
@@ -506,7 +540,7 @@ impl Model {
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
 
         let (attention_mask, sliding_attention_mask) =
-            self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
+            self.create_attention_masks(b_size, seq_len, seqlen_offset, None)?;
 
         for layer in self.layers.iter_mut() {
             let mask = if layer.sliding_window.is_some() {
@@ -528,9 +562,44 @@ impl Model {
         Ok(logits)
     }
 
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Vec<Tensor>> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(b_size, seq_len, seqlen_offset, attention_mask)?;
+
+        let mut hidden_states = Vec::with_capacity(self.layers.len() + 1);
+        hidden_states.push(xs.clone());
+        for layer in self.layers.iter_mut() {
+            let mask = if layer.sliding_window.is_some() {
+                &sliding_attention_mask
+            } else {
+                &attention_mask
+            };
+            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?;
+            hidden_states.push(xs.clone());
+        }
+        Ok(hidden_states)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 }
