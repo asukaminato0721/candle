@@ -267,12 +267,25 @@ fn load_model_config(config_file: &PathBuf) -> Result<VoxtralConfig> {
         .and_then(|v| v.as_str())
         .unwrap_or("gelu")
         .to_string();
+    let projector_hidden_size = json
+        .get("projector_hidden_size")
+        .or_else(|| json.get("projector_hidden_dim"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or_else(|| {
+            if audio_config.use_glm_encoder_names {
+                Some(text_config.hidden_size * 2)
+            } else {
+                None
+            }
+        });
 
     Ok(VoxtralConfig {
         audio_config,
         text_config,
         audio_token_id,
         projector_hidden_act,
+        projector_hidden_size,
     })
 }
 
@@ -281,6 +294,31 @@ fn parse_audio_config(json: &serde_json::Value) -> Result<VoxtralEncoderConfig> 
     let audio_json = json
         .get("audio_config")
         .ok_or_else(|| anyhow::anyhow!("Missing audio_config in configuration"))?;
+    let use_rope = audio_json
+        .get("use_rope")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| {
+            audio_json.get("rope_parameters").is_some()
+                || audio_json.get("partial_rotary_factor").is_some()
+        });
+    let model_type = audio_json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let use_glm_encoder_names = model_type == "glmasr_encoder";
+    let rope_theta = audio_json
+        .get("rope_theta")
+        .or_else(|| {
+            audio_json
+                .get("rope_parameters")
+                .and_then(|v| v.get("rope_theta"))
+        })
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10_000.0) as f32;
+    let partial_rotary_factor = audio_json
+        .get("partial_rotary_factor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(if use_rope { 0.5 } else { 1.0 }) as f32;
 
     Ok(VoxtralEncoderConfig {
         vocab_size: audio_json
@@ -321,11 +359,13 @@ fn parse_audio_config(json: &serde_json::Value) -> Result<VoxtralEncoderConfig> 
             .unwrap_or(0.0),
         activation_function: audio_json
             .get("activation_function")
+            .or_else(|| audio_json.get("hidden_act"))
             .and_then(|v| v.as_str())
             .unwrap_or("gelu")
             .to_string(),
         max_source_positions: audio_json
             .get("max_source_positions")
+            .or_else(|| audio_json.get("max_position_embeddings"))
             .and_then(|v| v.as_u64())
             .unwrap_or(1500) as usize,
         layerdrop: audio_json
@@ -348,6 +388,10 @@ fn parse_audio_config(json: &serde_json::Value) -> Result<VoxtralEncoderConfig> 
             .get("head_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or(64) as usize,
+        use_rope,
+        rope_theta,
+        partial_rotary_factor,
+        use_glm_encoder_names,
     })
 }
 

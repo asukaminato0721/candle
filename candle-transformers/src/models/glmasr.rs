@@ -10,6 +10,7 @@ pub struct GlmAsrConfig {
     pub audio_config: VoxtralEncoderConfig,
     pub text_config: VoxtralLlamaConfig,
     pub projector_hidden_act: String,
+    pub projector_hidden_size: Option<usize>,
     pub merge_factor: Option<usize>,
 }
 
@@ -97,6 +98,7 @@ impl GlmAsrForConditionalGeneration {
             text_config: cfg.text_config.clone(),
             audio_token_id: 0,
             projector_hidden_act: cfg.projector_hidden_act.clone(),
+            projector_hidden_size: cfg.projector_hidden_size,
         };
         let multi_modal_projector =
             VoxtralMultiModalProjector::new(&projector_cfg, vb.pp("multi_modal_projector"))?;

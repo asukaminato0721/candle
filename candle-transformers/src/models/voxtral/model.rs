@@ -20,6 +20,10 @@ pub struct VoxtralEncoderConfig {
     pub max_source_positions: usize,
     pub initializer_range: f64,
     pub attention_dropout: f64,
+    pub use_rope: bool,
+    pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
+    pub use_glm_encoder_names: bool,
     // These are set to 0.0 for compatibility with Whisper modular architecture
     pub dropout: f64,
     pub layerdrop: f64,
@@ -32,6 +36,7 @@ pub struct VoxtralConfig {
     pub text_config: VoxtralLlamaConfig,
     pub audio_token_id: usize,
     pub projector_hidden_act: String,
+    pub projector_hidden_size: Option<usize>,
 }
 
 impl Default for VoxtralConfig {
@@ -41,6 +46,7 @@ impl Default for VoxtralConfig {
             text_config: VoxtralLlamaConfig::voxtral_3b(),
             audio_token_id: 24,
             projector_hidden_act: "gelu".to_string(),
+            projector_hidden_size: None,
         }
     }
 }
@@ -61,6 +67,10 @@ impl Default for VoxtralEncoderConfig {
             max_source_positions: 1500,
             initializer_range: 0.02,
             attention_dropout: 0.0,
+            use_rope: false,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            use_glm_encoder_names: false,
             // Set for Whisper compatibility
             dropout: 0.0,
             layerdrop: 0.0,
@@ -268,6 +278,73 @@ struct VoxtralAttention {
     attention_dropout: Dropout,
 }
 
+#[derive(Debug, Clone)]
+struct VoxtralRotaryEmb {
+    cos: Tensor,
+    sin: Tensor,
+    dim: usize,
+}
+
+fn rotate_half(xs: &Tensor) -> Result<Tensor> {
+    let last_dim = xs.dim(D::Minus1)?;
+    let xs1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;
+    let xs2 = xs.narrow(D::Minus1, last_dim / 2, last_dim - last_dim / 2)?;
+    Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
+}
+
+impl VoxtralRotaryEmb {
+    fn new(cfg: &VoxtralEncoderConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let mut dim =
+            ((cfg.head_dim as f32) * cfg.partial_rotary_factor).round().max(0.0) as usize;
+        if dim > cfg.head_dim {
+            dim = cfg.head_dim;
+        }
+        if dim % 2 != 0 {
+            dim = dim.saturating_sub(1);
+        }
+        if dim == 0 {
+            candle::bail!("rotary_dim must be > 0");
+        }
+
+        let inv_freq: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?
+            .to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, cfg.max_source_positions as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((cfg.max_source_positions, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            dim,
+        })
+    }
+
+    fn apply(&self, x: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let (_b_sz, _h, seq_len, _n_embd) = x.dims4()?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+        let cos = if cos.dtype() != x.dtype() {
+            cos.to_dtype(x.dtype())?
+        } else {
+            cos
+        };
+        let sin = if sin.dtype() != x.dtype() {
+            sin.to_dtype(x.dtype())?
+        } else {
+            sin
+        };
+        x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
+    }
+}
+
 impl VoxtralAttention {
     fn new(cfg: &VoxtralEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let embed_dim = cfg.hidden_size;
@@ -287,7 +364,11 @@ impl VoxtralAttention {
         let q_proj = linear(embed_dim, embed_dim, vb.pp("q_proj"))?;
         let k_proj = linear_no_bias(embed_dim, embed_dim, vb.pp("k_proj"))?;
         let v_proj = linear(embed_dim, embed_dim, vb.pp("v_proj"))?;
-        let out_proj = linear(embed_dim, embed_dim, vb.pp("out_proj"))?;
+        let out_proj = if cfg.use_glm_encoder_names {
+            linear(embed_dim, embed_dim, vb.pp("o_proj"))?
+        } else {
+            linear(embed_dim, embed_dim, vb.pp("out_proj"))?
+        };
 
         let attention_dropout = Dropout::new(cfg.attention_dropout as f32);
 
@@ -308,10 +389,51 @@ impl VoxtralAttention {
             .transpose(1, 2)?
             .contiguous()
     }
+
+    fn apply_rotary_emb(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        rotary_emb: &VoxtralRotaryEmb,
+    ) -> Result<(Tensor, Tensor)> {
+        let rot_dim = rotary_emb.dim;
+        if rot_dim > self.head_dim {
+            candle::bail!(
+                "rotary_dim {} exceeds head_dim {}",
+                rot_dim,
+                self.head_dim
+            );
+        }
+
+        let q_rot = q.narrow(D::Minus1, 0, rot_dim)?.contiguous()?;
+        let k_rot = k.narrow(D::Minus1, 0, rot_dim)?.contiguous()?;
+        let q_rot = rotary_emb.apply(&q_rot, 0)?;
+        let k_rot = rotary_emb.apply(&k_rot, 0)?;
+
+        if rot_dim == self.head_dim {
+            return Ok((q_rot, k_rot));
+        }
+
+        let q_pass = q.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+        let k_pass = k.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+        let q = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?;
+        let k = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?;
+        Ok((q, k))
+    }
 }
 
 impl Module for VoxtralAttention {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_rope(x, None)
+    }
+}
+
+impl VoxtralAttention {
+    fn forward_with_rope(
+        &self,
+        x: &Tensor,
+        rotary_emb: Option<&VoxtralRotaryEmb>,
+    ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;
 
         // Project queries, keys, and values - apply scaling to queries to match PyTorch SDPA
@@ -323,6 +445,14 @@ impl Module for VoxtralAttention {
         let q = self.reshape_for_scores(&q, seq_len, bsz)?;
         let k = self.reshape_for_scores(&k, seq_len, bsz)?;
         let v = self.reshape_for_scores(&v, seq_len, bsz)?;
+
+        let (q, k) = if let Some(rotary_emb) = rotary_emb {
+            self.apply_rotary_emb(q, k, rotary_emb)?
+        } else {
+            (q, k)
+        };
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
 
         // Manual SDPA-like implementation to match Python's numerical behavior exactly
         // Use F16 precision throughout to match PyTorch's F16 model
@@ -365,10 +495,29 @@ impl VoxtralEncoderLayer {
         let embed_dim = cfg.hidden_size;
 
         let self_attn = VoxtralAttention::new(cfg, vb.pp("self_attn"))?;
-        let self_attn_layer_norm = layer_norm(embed_dim, 1e-5, vb.pp("self_attn_layer_norm"))?;
-        let fc1 = linear(embed_dim, cfg.intermediate_size, vb.pp("fc1"))?;
-        let fc2 = linear(cfg.intermediate_size, embed_dim, vb.pp("fc2"))?;
-        let final_layer_norm = layer_norm(embed_dim, 1e-5, vb.pp("final_layer_norm"))?;
+        let (self_attn_layer_norm, final_layer_norm) = if cfg.use_glm_encoder_names {
+            (
+                layer_norm(embed_dim, 1e-5, vb.pp("input_layernorm"))?,
+                layer_norm(embed_dim, 1e-5, vb.pp("post_attention_layernorm"))?,
+            )
+        } else {
+            (
+                layer_norm(embed_dim, 1e-5, vb.pp("self_attn_layer_norm"))?,
+                layer_norm(embed_dim, 1e-5, vb.pp("final_layer_norm"))?,
+            )
+        };
+        let (fc1, fc2) = if cfg.use_glm_encoder_names {
+            let vb_mlp = vb.pp("mlp");
+            (
+                linear(embed_dim, cfg.intermediate_size, vb_mlp.pp("fc1"))?,
+                linear(cfg.intermediate_size, embed_dim, vb_mlp.pp("fc2"))?,
+            )
+        } else {
+            (
+                linear(embed_dim, cfg.intermediate_size, vb.pp("fc1"))?,
+                linear(cfg.intermediate_size, embed_dim, vb.pp("fc2"))?,
+            )
+        };
 
         let activation = match cfg.activation_function.as_str() {
             "gelu" => candle_nn::Activation::Gelu,
@@ -400,11 +549,16 @@ impl VoxtralEncoderLayer {
         self.fc1.weight().dims()[0]
     }
 
-    fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        training: bool,
+        rotary_emb: Option<&VoxtralRotaryEmb>,
+    ) -> Result<Tensor> {
         // Self-attention with residual connection
         let residual = x;
         let x = self.self_attn_layer_norm.forward(x)?;
-        let x = self.self_attn.forward(&x)?;
+        let x = self.self_attn.forward_with_rope(&x, rotary_emb)?;
         let x = self.dropout.forward(&x, training)?;
         let x = (x + residual)?;
 
@@ -427,7 +581,8 @@ impl VoxtralEncoderLayer {
 pub struct VoxtralEncoder {
     conv1: Conv1d,
     conv2: Conv1d,
-    embed_positions: Tensor,
+    embed_positions: Option<Tensor>,
+    rotary_emb: Option<VoxtralRotaryEmb>,
     layers: Vec<VoxtralEncoderLayer>,
     layer_norm: LayerNorm,
     dropout: Dropout,
@@ -465,11 +620,21 @@ impl VoxtralEncoder {
             vb.pp("conv2"),
         )?;
 
+        let rotary_emb = if cfg.use_rope {
+            Some(VoxtralRotaryEmb::new(&cfg, vb.device(), vb.dtype())?)
+        } else {
+            None
+        };
+
         // Position embeddings
-        let embed_positions = vb.get(
-            (cfg.max_source_positions, embed_dim),
-            "embed_positions.weight",
-        )?;
+        let embed_positions = if cfg.use_rope {
+            None
+        } else {
+            Some(vb.get(
+                (cfg.max_source_positions, embed_dim),
+                "embed_positions.weight",
+            )?)
+        };
 
         // Transformer layers
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -480,13 +645,18 @@ impl VoxtralEncoder {
             )?);
         }
 
-        let layer_norm = layer_norm(embed_dim, 1e-5, vb.pp("layer_norm"))?;
+        let layer_norm = if cfg.use_glm_encoder_names {
+            layer_norm(embed_dim, 1e-5, vb.pp("norm"))?
+        } else {
+            layer_norm(embed_dim, 1e-5, vb.pp("layer_norm"))?
+        };
         let dropout = Dropout::new(cfg.dropout as f32);
 
         Ok(Self {
             conv1,
             conv2,
             embed_positions,
+            rotary_emb,
             layers,
             layer_norm,
             dropout,
@@ -558,26 +728,30 @@ impl VoxtralEncoder {
         // Reshape: (batch, embed_dim, seq_len) -> (batch, seq_len, embed_dim)
         let x = x.transpose(1, 2)?;
 
-        // Add position embeddings - handle F32 position embeddings + F16 hidden states like PyTorch
-        let seq_len = x.dim(1)?;
-        let positions = self.embed_positions.i(..seq_len)?;
+        let x = if let Some(positions) = &self.embed_positions {
+            // Add position embeddings - handle F32 position embeddings + F16 hidden states like PyTorch
+            let seq_len = x.dim(1)?;
+            let positions = positions.i(..seq_len)?;
 
-        // PyTorch automatically promotes F16 + F32 -> F32, then converts back to original dtype
-        // We need to match this behavior exactly
-        let x = if false {
-            // Keep position embeddings in mixed precision
-            // Force F32 computation for position embeddings
-            let x_f32 = x.to_dtype(candle::DType::F32)?;
-            let positions_f32 = positions.to_dtype(candle::DType::F32)?;
-            x_f32.broadcast_add(&positions_f32)? // Keep result in F32
-        } else if x.dtype() != positions.dtype() {
-            // Convert hidden states to F32 for addition (positions are already F32)
-            let x_f32 = x.to_dtype(candle::DType::F32)?;
-            let result_f32 = x_f32.broadcast_add(&positions)?;
-            // Convert back to original hidden states dtype (F16)
-            result_f32.to_dtype(x.dtype())?
+            // PyTorch automatically promotes F16 + F32 -> F32, then converts back to original dtype
+            // We need to match this behavior exactly
+            if false {
+                // Keep position embeddings in mixed precision
+                // Force F32 computation for position embeddings
+                let x_f32 = x.to_dtype(candle::DType::F32)?;
+                let positions_f32 = positions.to_dtype(candle::DType::F32)?;
+                x_f32.broadcast_add(&positions_f32)? // Keep result in F32
+            } else if x.dtype() != positions.dtype() {
+                // Convert hidden states to F32 for addition (positions are already F32)
+                let x_f32 = x.to_dtype(candle::DType::F32)?;
+                let result_f32 = x_f32.broadcast_add(&positions)?;
+                // Convert back to original hidden states dtype (F16)
+                result_f32.to_dtype(x.dtype())?
+            } else {
+                x.broadcast_add(&positions)?
+            }
         } else {
-            x.broadcast_add(&positions)?
+            x
         };
 
         // Apply dropout
@@ -614,7 +788,7 @@ impl VoxtralEncoder {
             }
         }
 
-        layer.forward(x, training)
+        layer.forward(x, training, self.rotary_emb.as_ref())
     }
 
     /// Get the output dimension of the first FC layer (needed for projector)
@@ -688,14 +862,17 @@ pub struct VoxtralMultiModalProjector {
 
 impl VoxtralMultiModalProjector {
     pub fn new(cfg: &VoxtralConfig, vb: VarBuilder) -> Result<Self> {
+        let projector_hidden_size = cfg
+            .projector_hidden_size
+            .unwrap_or(cfg.text_config.hidden_size);
         let linear_1 = linear_no_bias(
             cfg.audio_config.intermediate_size,
-            cfg.text_config.hidden_size,
+            projector_hidden_size,
             vb.pp("linear_1"),
         )?;
 
         let linear_2 = linear_no_bias(
-            cfg.text_config.hidden_size,
+            projector_hidden_size,
             cfg.text_config.hidden_size,
             vb.pp("linear_2"),
         )?;
