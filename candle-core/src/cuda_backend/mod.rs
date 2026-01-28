@@ -94,8 +94,15 @@ impl Map1 for Clone {
     }
 }
 
+fn cuda_dtype_str(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F8E4M3 => "f8_e4m3",
+        _ => dtype.as_str(),
+    }
+}
+
 pub fn kernel_name<T: WithDType>(root: &str) -> String {
-    let dtype = T::DTYPE.as_str();
+    let dtype = cuda_dtype_str(T::DTYPE);
     format!("{root}_{dtype}")
 }
 

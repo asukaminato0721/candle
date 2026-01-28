@@ -155,7 +155,9 @@ fn main() -> Result<()> {
     } else {
         Device::new_cuda(0)?
     };
-    device.set_seed(args.seed)?;
+    if !args.cpu {
+        device.set_seed(args.seed)?;
+    }
 
     let dtype = if args.use_f16 {
         DType::F16
