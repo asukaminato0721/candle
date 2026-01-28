@@ -88,8 +88,9 @@ impl GlmAsrModel {
                 .context("Failed to resample audio")?
         };
 
-        let padded_audio = if audio.len() % CHUNK_SAMPLES != 0 {
-            let target_samples = ((audio.len() / CHUNK_SAMPLES) + 1) * CHUNK_SAMPLES;
+        let audio_len = audio.len();
+        let padded_audio = if audio_len % CHUNK_SAMPLES != 0 {
+            let target_samples = ((audio_len / CHUNK_SAMPLES) + 1) * CHUNK_SAMPLES;
             let mut padded = audio.clone();
             padded.resize(target_samples, 0.0);
             padded
@@ -106,7 +107,7 @@ impl GlmAsrModel {
             .context("Failed to extract audio features")?;
 
         let (tokens, audio_offsets, audio_lengths) =
-            build_prompt(&self.tokenizer, audio.len(), SAMPLE_RATE, self.merge_factor)?;
+            build_prompt(&self.tokenizer, audio_len, SAMPLE_RATE, self.merge_factor)?;
 
         let prompt_len = tokens.len();
         let input_ids = Tensor::new(tokens.clone(), &self.device)?.unsqueeze(0)?;
