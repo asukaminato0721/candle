@@ -12,11 +12,18 @@ struct KernelDirectories {
     include_dirs: &'static [&'static str],
 }
 
-const KERNEL_DIRS: [KernelDirectories; 1] = [KernelDirectories {
-    kernel_glob: "examples/custom-ops/kernels/*.cu",
-    rust_target: "examples/custom-ops/cuda_kernels.rs",
-    include_dirs: &[],
-}];
+const KERNEL_DIRS: [KernelDirectories; 2] = [
+    KernelDirectories {
+        kernel_glob: "examples/custom-ops/kernels/*.cu",
+        rust_target: "examples/custom-ops/cuda_kernels.rs",
+        include_dirs: &[],
+    },
+    KernelDirectories {
+        kernel_glob: "examples/tha3/kernels/*.cu",
+        rust_target: "examples/tha3/tha3_cuda_kernels.rs",
+        include_dirs: &[],
+    },
+];
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
